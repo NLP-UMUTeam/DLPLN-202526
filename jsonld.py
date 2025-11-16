@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Ejemplo de uso:
 --------------
@@ -9,6 +8,9 @@ El script:
 - Extrae bloques <script type="application/ld+json">
 - Busca el que tenga @type "NewsArticle" o "Article"
 - Imprime el JSON-LD formateado
+
+@author Rafael Valencia-García <valencia@um.es>
+@author José Antonio García-Díaz <joseantonio.garcia8@um.es>
 """
 
 import argparse
