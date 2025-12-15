@@ -1,0 +1,352 @@
+"""
+DL-PLN 2025/26 – ATLAS v2
+
+Supervised Fine-Tuning (SFT) with LoRA on an ALPACA-style dataset (Spanish).
+
+Dataset:
+- bertin-project/alpaca-spanish (instruction, input, output)
+
+What we want to achieve:
+- Take a base LLM (Llama) and adapt it to follow instructions in Spanish.
+- Do it efficiently with LoRA (parameter-efficient fine-tuning), because:
+  * Full fine-tuning is expensive (VRAM + time + disk)
+  * LoRA trains only small "adapter" matrices while keeping base weights frozen
+
+Model note (IMPORTANT):
+- This practice uses Llama (Meta)
+- Many Llama checkpoints on Hugging Face are gated (require authentication).
+  It is recommended to provide HF_TOKEN via environment:
+      export HF_TOKEN="hf_..."
+
+We use 4-bit quantization because:
+- (1) GPUs like Tesla T4 (16 GB VRAM) are limited.
+- (2) Loading the base model in 4-bit reduces VRAM usage drastically.
+- (3) Combined with LoRA (QLoRA-style training), SFT becomes feasible on small GPUs.
+
+What we save:
+- LoRA adapter (small, very important)
+- Tokenizer (small)
+- A small demo text output
+
+However, we keep the merged model in /scratch because it is a large model.
+
+Authors:
+@author Ronghao Pan <ronghao.pan@um.es>
+@author José Antonio García-Díaz <joseantonio.garcia8@um.es>
+@author Rafael Valencia-García <valencia@um.es>
+"""
+
+import os
+from pathlib import Path
+from shutil import copytree, rmtree
+
+import torch
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    BitsAndBytesConfig,
+)
+
+from peft import (
+    LoraConfig,
+    AutoPeftModelForCausalLM,
+    prepare_model_for_kbit_training,
+    TaskType,
+)
+
+from trl import SFTTrainer
+from trl.trainer import ConstantLengthDataset
+from accelerate import Accelerator
+from tqdm import tqdm
+
+from atlas_utils import (
+    ensure_dir,
+    setup_hf_caches,
+    set_seed,
+    get_device,
+)
+
+from sft_utils import (
+    prepare_sample_text,
+    chars_token_ratio,
+)
+
+
+def generate_demo (model, tokenizer, prompt: str, device):
+    """
+    Generate one completion from the merged model (didactic demo).
+
+    Args:
+        model: Causal LM model
+        tokenizer: tokenizer
+        prompt (str): input prompt
+        device: torch device
+
+    Returns:
+        str: generated text
+    """
+    inputs = tokenizer (prompt, return_tensors = "pt").to (device)
+
+    with torch.no_grad ():
+        out = model.generate (
+            **inputs,
+            max_new_tokens = 128,
+            do_sample = True,
+            temperature = 0.7,
+            top_p = 0.9,
+            eos_token_id = tokenizer.eos_token_id,
+        )
+
+    return tokenizer.decode (out[0], skip_special_tokens = True)
+
+
+def main():
+    """
+    Pipeline:
+
+    1) Setup scratch + caches + seed + device
+    2) Load dataset (alpaca-spanish) and train/valid split
+    3) Load tokenizer + base model (4-bit)
+    4) Prepare model for k-bit training + attach LoRA adapters
+    5) Run SFT training with TRL SFTTrainer
+    6) Save LoRA adapter + tokenizer
+    7) Merge LoRA into base model and save final checkpoint (scratch)
+    8) Copy small artifacts to HOME (LoRA + tokenizer + demo)
+    """
+    
+    # 1) Setup
+    hf_home, scratch_base = setup_hf_caches ()
+    set_seed (42)
+    device = get_device ()
+
+    print ("[INFO] hostname:", os.uname ().nodename)
+    print ("[INFO] scratch_base:", scratch_base)
+    print ("[INFO] HF_HOME:", os.environ.get ("HF_HOME"))
+    
+    
+    # Paths
+    out_dir = ensure_dir (scratch_base / "out" / "sft_alpaca")
+    lora_dir = ensure_dir (out_dir / "LlamaAlpaca_lora")
+    merged_dir = ensure_dir (out_dir / "final_checkpoint")
+    tok_dir = ensure_dir (out_dir / "tokenizer")
+    report_dir = ensure_dir (out_dir / "reports")
+    
+    
+    # HF token (for gated models)
+    token = os.getenv ("HF_TOKEN", None)
+    if token is None or token.strip () == "":
+        print ("[WARN] HF_TOKEN is not set. Download may fail if the model is gated.")
+        print ("       Recommended: export HF_TOKEN='hf_...'")
+
+
+    # 2) Dataset (Alpaca Spanish)
+    dataset = load_dataset (
+        "bertin-project/alpaca-spanish",
+        split = "train",
+        streaming = False,
+        cache_dir = str (hf_home / "datasets"),
+    )
+    
+
+    dataset = dataset.train_test_split (test_size = 0.2, seed = 42)
+    train_data = dataset["train"]
+    valid_data = dataset["test"]
+    
+    
+    # 3) Base model and tokenizer
+    model_id = "meta-llama/Llama-3.2-1B"
+    tokenizer = AutoTokenizer.from_pretrained (
+        model_id,
+        use_fast = True,
+        token = token,
+        cache_dir = str (hf_home / "transformers"),
+    )
+    
+    
+    # TRL constant-length packing (efficient for SFT)
+    chars_per_token = chars_token_ratio (train_data, tokenizer)
+    train_dataset = ConstantLengthDataset (
+        tokenizer,
+        train_data,
+        formatting_func = prepare_sample_text,
+        infinite = True,
+        seq_length = 1024,
+        chars_per_token = chars_per_token,
+    )
+    
+    valid_dataset = ConstantLengthDataset (
+        tokenizer,
+        valid_data,
+        formatting_func = prepare_sample_text,
+        infinite = False,
+        seq_length = 1024,
+        chars_per_token = chars_per_token,
+    )
+    
+    
+    # 4) Quantization config (4-bit) + load model
+    # bfloat16 is nice if available; if it fails in your container, switch to torch.float16.
+    bnb_config = BitsAndBytesConfig (
+        load_in_4bit = True,
+        bnb_4bit_quant_type = "nf4",
+        bnb_4bit_compute_dtype = torch.bfloat16,
+    )
+    
+
+    model = AutoModelForCausalLM.from_pretrained (
+        model_id,
+        quantization_config = bnb_config,
+        device_map = {"": Accelerator ().local_process_index},
+        trust_remote_code = True,
+        token = token,
+        cache_dir = str (hf_home / "transformers"),
+    )
+    
+    
+    # Make sure padding exists (some LLM tokenizers do not define pad_token)
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens ({"pad_token": "[PAD]"})
+        model.resize_token_embeddings (len (tokenizer))
+        
+        
+    # Important for training stability with gradient checkpointing / trainer loops
+    model.config.use_cache = False
+    
+    
+    # 5) LoRA configuration
+    # LoRA trains small rank-decomposition matrices on key modules (q/k/v projections etc.)
+    # This is much cheaper than full fine-tuning.
+    lora_config = LoraConfig (
+        r = 8,
+        lora_alpha = 16,
+        target_modules = [
+            "q_proj", "o_proj", "k_proj", "v_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ],
+        lora_dropout = 0.05,
+        bias = "none",
+        task_type = TaskType.CAUSAL_LM,
+    )
+    
+    
+    # Prepare model for k-bit training (QLoRA-style)
+    model = prepare_model_for_kbit_training (model)
+    
+    
+    # 6) Training arguments
+    # - per_device_train_batch_size=1: safe for small GPUs and long seq_length
+    # - fp16=True: mixed precision to reduce VRAM and speed up training (T4-friendly)
+    # - max_steps: limits the training for small practice
+    training_args = TrainingArguments (
+        output_dir = str (out_dir / "trainer_runs"),
+        num_train_epochs = 1,
+        max_steps = 500,
+
+        evaluation_strategy = "epoch",
+        save_strategy = "epoch",
+        save_total_limit = 1,
+
+        per_device_train_batch_size = 1,
+        per_device_eval_batch_size = 1,
+
+        fp16 = True,
+        weight_decay = 0.05,
+        learning_rate = 1e-4,
+        warmup_steps = 100,
+
+        report_to = [],
+        logging_steps = 25,
+    )
+
+    trainer = SFTTrainer (
+        model = model,
+        train_dataset = train_dataset,
+        eval_dataset = valid_dataset,
+        peft_config = lora_config,
+        packing = True,
+        max_seq_length = None,
+        tokenizer = tokenizer,
+        args = training_args,
+    )
+
+    # 7) Train
+    trainer.train ()
+    
+    
+    # 8) Save LoRA adapter + tokenizer (small artifacts)
+    trainer.save_model (str (lora_dir))
+    tokenizer.save_pretrained (str (tok_dir))
+    
+    
+    # 9) Merge LoRA into base model (creates a standard Transformers model)
+    merged = AutoPeftModelForCausalLM.from_pretrained (
+        str (lora_dir),
+        torch_dtype = torch.bfloat16,
+        token = token,
+        device_map = "auto",
+    )
+
+    merged = merged.merge_and_unload ()
+    merged.save_pretrained (str (merged_dir), safe_serialization = True)
+    tokenizer.save_pretrained (str (merged_dir))
+
+    print (f"[OK] LoRA adapter saved to: {lora_dir}")
+    print (f"[OK] Merged model saved to: {merged_dir}")
+    print (f"[OK] Tokenizer saved to: {tok_dir}")
+    
+    
+    # 10) Demo: use merged model for one real example (utility)
+    demo_prompt = (
+        "### Question:\n"
+        "Redacta un correo breve y educado para cancelar una cita médica.\n\n"
+        "### Response:\n"
+    )
+    
+    
+    # Note: merged model is loaded on device_map="auto"; use device from get_device() for inputs
+    demo_text = generate_demo (
+        model = merged,
+        tokenizer = tokenizer,
+        prompt = demo_prompt,
+        device = device
+    )
+
+    demo_path_scratch = report_dir / "demo_generation.txt"
+    demo_path_scratch.write_text (demo_text, encoding = "utf-8")
+    
+    
+    # 11) Copy small artifacts to HOME (quota-friendly)
+    home_base = Path.home ()
+    home_models = ensure_dir (home_base / "models")
+    home_reports = ensure_dir (home_base / "reports")
+
+    home_lora = home_models / "LlamaAlpaca_lora"
+    home_tokenizer = home_models / "tokenizer"
+    home_demo = home_reports / "sft_demo_generation.txt"
+    
+    
+    # Copy LoRA adapter
+    if home_lora.exists ():
+        rmtree (home_lora)
+    copytree (lora_dir, home_lora)
+
+    # Copy tokenizer
+    if home_tokenizer.exists ():
+        rmtree (home_tokenizer)
+    copytree (tok_dir, home_tokenizer)
+    
+    
+    # Copy demo text
+    home_demo.write_text (demo_text, encoding = "utf-8")
+
+    print ("[OK] LoRA adapter and tokenizer copied to HOME")
+    print (f"     {home_lora}")
+    print (f"     {home_tokenizer}")
+    print ("[OK] Demo copied to HOME")
+    print (f"     {home_demo}")
+
+
+if __name__ == "__main__":
+    main ()

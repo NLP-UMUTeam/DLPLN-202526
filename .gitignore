@@ -1,0 +1,53 @@
+out*.txt
+err*.txt
+slurm-*.out
+*.log
+.ipynb_checkpoints/
+
+.hf/
+.cache/
+.torch/
+datasets/
+transformers/
+wandb/
+torch_cache/
+nv_cache/
+
+# ----------------------------
+# Training outputs / checkpoints
+# ----------------------------
+results/
+result/
+output/
+outputs/
+runs/
+trainer_runs/
+checkpoints/
+checkpoint-*/
+log/
+logs/
+tb_logs/
+mlruns/
+
+# ----------------------------
+# Models / artifacts (local copies)
+# ----------------------------
+model/
+models/
+model_finetuned/
+final_checkpoint/
+*_lora/
+tokenizer/
+reports/
+
+# ----------------------------
+# Data
+# ----------------------------
+data/
+*.csv
+*.tsv
+*.jsonl
+*.parquet
+
+# Others
+praw-reddit-pepe.py
